@@ -1,67 +1,138 @@
-using SymPy
-# time
-@vars t
-# define parameteric state variables
-# 10D state
-x1, y1, z1, theta, psi = symbols("x1 y1 z1 theta psi", cls=sympy.Function)
-x1, y1, z1, theta, psi = x1(t), y1(t), z1(t), theta(t), psi(t)
-dx1, dy1, dz1, dtheta, dpsi = diff(x1, t), diff(y1, t), diff(z1, t), diff(theta, t), diff(psi, t)
-# static parts of eqn
-@vars M m g r
+# Derived from https://www.flyingmachinearena.ethz.ch/wp-content/publications/2011/hehn_dandrea_flying_inverted_pendulum.pdf
+using LinearAlgebra, ControlSystems
 
-# build eqn constraints
-x2 = r * (dtheta * cos(theta) * cos(psi) - dpsi * sin(theta) * sin(psi)) + dx1 #TODO: could this all be easier in spherical coordinates?
-y2 = r * (dtheta * cos(theta) * sin(psi) + dpsi * sin(theta) * cos(psi)) + dy1
-z2 = r * sin(psi) + z1
-dx2 = diff(x2, t)
-dy2 = diff(y2, t)
-dz2 = diff(z2, t)
+#=
+  Compute FSFB Controller K matrix based on
+  1. linearized system dynamics derived from taylor series approximation. 
+  2. dx/dt = (A - BK)x, where K is the LQR solution given A, B, and Q/R matrices
 
-# build lagrangian
-PE = (M * g * z1) + (m * g * (z1 + r * cos(theta)))
-v1 = sqrt(dx1^2 + dy1^2 + dz1^2)
-v2 = sqrt(dx2^2 + dy2^2 + dz2^2)
-KE = Rational(1, 2) * M * v1^2 + Rational(1, 2) * m * v2^2
-L = KE - PE
+  x/y & z systems are separated
 
-# L differentiated wrt acceleration of system
-dL_dtheta_dt = diff(diff(L, dtheta), t)
-dL_dpsi_dt = diff(diff(L, dpsi), t)
-dL_dx1_dt = diff(diff(L, dx1), t)
-dL_dy1_dt = diff(diff(L, dy1), t)
-dL_dz1_dt = diff(diff(L, dz1), t)
+  below are three lqr computations for three separated flight controllers based on the total 13 state, 4 control system for the drone:
+    an x-axis controller
+    a y-axis controller
+    and a z-axis controller
 
-# L differentiated wrt to state of system
-dL_theta = diff(L, theta)
-dL_psi = diff(L, psi)
-dL_x1 = diff(L, x1)
-dL_y1 = diff(L, y1)
-dL_z1 = diff(L, z1)
+  The x & y axis controllers are both 5-state single input controllers: 
+    states:
+      x/y, 
+      resp. velocity, 
+      resp. euler angle of vehicle body, 
+      resp. pendulum-COM offset diff component, 
+      its resp. velocity
+    control:
+      x/y rotational body rate (ω x/y)
+
+  The z axis controller is a 2-state single input controller:
+    states:
+      z position of vehicle body
+      z component velocity of vehicle body
+
+    control:
+      acceleration produced by quadcopter thrust
+=#
 
 
-Qi_theta = simplify(dL_dtheta_dt - dL_theta)
-Qi_psi = simplify(dL_dpsi_dt - dL_psi)
-Qi_x1 = simplify(dL_dx1_dt - dL_x1)
-Qi_y1 = simplify(dL_dy1_dt - dL_y1)
-Qi_z1 = simplify(dL_dz1_dt - dL_z1)
+# Tunable cost paramaters for LQR. 
+#   Q matrix is set up to penalize cost of position of drone
+#   R matrix is set up to penalize cost of control inputs (ie battery life, want to move optimally, but quickly)
+qQ = [
+  1 0 0 0 0
+  0 0 0 0 0
+  0 0 0 0 0
+  0 0 0 0 0
+  0 0 0 0 0
+]
 
-print("here goes...")
-theta_accel = solve(Eq(Qi_theta, 0), theta.diff(t, t))
-print("made it")
-# At this point, we could try and compute out the 10D state vector's rate of change:
-# psi_accel = solve(Eq(Qi_psi, 0), psi.diff(t, t))
-# x1_accel = solve(Eq(Qi_x1, 0), x1.diff(t, t))
-# y1_accel = solve(Eq(Qi_y1, 0), y1.diff(t, t))
-# z1_accel = solve(Eq(Qi_z1, 0), z1.diff(t, t))
+qR = 100 * I
 
-# theta_vel = solve(Eq(Qi_theta, 0), theta.diff(t))
-# psi_vel = solve(Eq(Qi_psi, 0), psi.diff(t))
-# x1_vel = solve(Eq(Qi_x1, 0), x1.diff(t))
-# y1_vel = solve(Eq(Qi_y1, 0), y1.diff(t))
-# z1_vel = solve(Eq(Qi_z1, 0), z1.diff(t))
+# Produce the A matrix for the x & y controllers based on parameters
+# g : gravitational constant
+# L : length of pendulum to center of mass
+# isX: true if for x controller, false for y controller
+function qA(g, L, isX::Bool)
+  sign = isX ? 1 : -1
+  [
+    0 1 0 0 0
+    0 0 sign*g 0 0
+    0 0 0 0 0
+    0 0 0 0 1
+    0 0 -sign*g g/L 0
+  ]
+end
 
-# The problem is that the equations are prohibitively absurd and complex.
-# After reading through https://www.flyingmachinearena.ethz.ch/wp-content/publications/2011/hehn_dandrea_flying_inverted_pendulum.pdf
-# it seems like the problem comes from defining the attitude of the pendulum in terms of just two angles: theta and psi.
-# If, instead, I were to use euler angles to first create a transformation between inertial frames, this shakes out to yield a state vector in 7 variables, which although complex
-# seems much less complex than my naive attempt, and is smaller than my 10D attempt.
+g, L = 9.81, 1
+xA = qA(g, L, true)
+yA = qA(g, L, false)
+
+# identical for both x and y controllers 
+qB = [
+  0
+  0
+  1
+  0
+  0
+]
+
+zQ = [
+  1 0
+  0 0
+]
+
+zR = qR
+
+zA = [
+  0 1
+  0 0
+]
+
+zB = [0; 1]
+
+xK = lqr(Continuous, xA, qB, qQ, qR)
+yK = lqr(Continuous, yA, qB, qQ, qR)
+zK = lqr(Continuous, zA, zB, zQ, zR)
+
+# Simulation:
+#  Given some simple initial condition, we can update the system continuously and observe it approaching the zero which the system has been linearized about.
+
+x = [
+  10 # x coord
+  0.5 # x speed
+  20 * 2 * pi / 360 # euler angle (rads) 
+  0.1 # center of mass offset
+  0.2 # COM offset speed 
+]
+
+y = [
+  4 # y coord
+  2 # y speed
+  20 * 2 * pi / 360 # euler angle (rads)
+  0.1 # center of mass offset (y)
+  0.06 # COM offset speed
+]
+
+z = [
+  5 # z coord
+  0 # z speed
+]
+
+print("Initial condition for x state is: ")
+println(x)
+print("Initial condition for y state is: ")
+println(y)
+print("Initial condition for z state is: ")
+println(z)
+
+# iterate for one thousand 100ms time steps steps
+for i in 1:1000
+  global x += (xA - (qB * xK)) * x * 0.1
+  global y += (yA - (qB * yK)) * y * 0.1
+  global z += (zA - (zB * zK)) * z * 0.1
+end
+
+print("Final condition for x state is: ")
+println(x)
+print("Final condition for y state is: ")
+println(y)
+print("Final condition for z state is: ")
+println(z)
